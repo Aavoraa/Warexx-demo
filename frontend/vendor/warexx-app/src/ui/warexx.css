@@ -235,7 +235,8 @@ td.num, th.num, .num { font-variant-numeric: tabular-nums; }
 /* the workspace / facility menu opens beside the navigation */
 .th-pop.wx-wspop { position: fixed; top: 12px; left: calc(var(--x-rail) + 12px); right: auto; width: 340px; z-index: 90;
   animation: wx-pop .16s var(--x-ease); }
-.th-pop { border-radius: var(--x-r-lg) !important; box-shadow: var(--x-pop) !important; border: 0 !important; }
+.th-pop { border-radius: var(--x-r-lg) !important; box-shadow: var(--x-pop) !important; border: 0 !important;
+  z-index: 90; } /* above .th-scrim (85), or the scrim takes every click meant for the menu */
 .th-scrim { z-index: 85; }
 /* The menu is fixed over the navigation, but it lives inside the top bar, whose
    z-index (15) is a stacking context under the nav's (20) — so it opened behind
