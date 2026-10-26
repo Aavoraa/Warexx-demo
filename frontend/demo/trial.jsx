@@ -1,0 +1,362 @@
+// The demo's sign-up / sign-in, for a slot booked on the landing page.
+//
+//   landing contact form (with a slot) ──► /demo/#t=<ticket>
+//        ──► SIGN UP: email filled in, choose a password
+//        ──► the demo, for two hours from the start of the slot
+//        ──► then the password stops working and a "subscribe" card covers it
+//
+// Or, when the server emails the login details (DEMO_EMAIL_PASSWORD, the local
+// server with its database): SIGN IN with the login email + the password from
+// the email, on any device. /api/trial "status" says which.
+//
+// The passes (ticket, account, session) are signed by the server
+// (lead-api/trial.py) and checked there, against its clock, on every visit and
+// every few minutes during one — so moving the window here changes nothing.
+// On only when built with VITE_DEMO_TRIAL=1 (npm run build:site); the stand-alone
+// demo and the phone apps' bundled demo stay open.
+import React, { useEffect, useRef, useState } from 'react'
+import { BrandMark, Wordmark } from '../vendor/warexx-app/src/brand.jsx'
+
+export const TRIAL_ON = import.meta.env.VITE_DEMO_TRIAL === '1'
+const LANDING = import.meta.env.VITE_LANDING_URL || '/'
+const K = { ticket: 'wx_trial_ticket', account: 'wx_trial_account', session: 'wx_trial_session' }
+const store = {
+  get: (k) => { try { return localStorage.getItem(K[k]) || '' } catch { return '' } },
+  set: (k, v) => { try { v ? localStorage.setItem(K[k], v) : localStorage.removeItem(K[k]) } catch { /* private mode */ } },
+}
+
+/** The guided tour finished or skipped: kept against this trial on the server
+ *  (lead-api/store.py), so it is not offered again on another device. */
+export function reportTour(state) {
+  const session = store.get('session')
+  if (TRIAL_ON && session) call('tour', { session, state })
+}
+
+/** The signed-in trial user's email, or '' (the demo without sign-up). */
+export function trialUser() { return (TRIAL_ON && peek(store.get('session'))?.e) || '' }
+
+/** The readable half of a pass (the server checks the signature, not this). */
+export function peek(pass) {
+  try {
+    const b = pass.split('.')[0].replace(/-/g, '+').replace(/_/g, '/')
+    return JSON.parse(decodeURIComponent(escape(atob(b + '='.repeat((4 - (b.length % 4)) % 4)))))
+  } catch { return null }
+}
+
+async function call(action, body) {
+  let r
+  try {
+    r = await fetch('/api/trial', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, ...body }) })
+  } catch { return { status: 0, detail: 'offline' } }
+  let j = {}
+  try { j = await r.json() } catch { /* empty */ }
+  return r.ok ? { ok: true, ...j } : { status: r.status, ...j }
+}
+
+/** A ticket handed over in the address (#t=…) from the landing page: kept, and
+ *  taken out of the address. A new booking replaces the old account. */
+export function takeTicketFromUrl() {
+  const m = location.hash.match(/[#&]t=([^&]+)/)
+  if (!m) return
+  const t = decodeURIComponent(m[1])
+  if (t !== store.get('ticket')) { store.set('ticket', t); store.set('account', ''); store.set('session', '') }
+  history.replaceState(null, '', location.pathname + location.search)
+}
+
+const fmtWhen = (sec) => new Date(sec * 1000).toLocaleString(undefined,
+  { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })
+const left = (ms) => {
+  const s = Math.max(0, Math.round(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60)
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`
+}
+
+/** Checks the stored session with the server: { state: 'open'|'not_yet'|'expired'|'none'|'error', end, start } */
+export async function checkSession() {
+  const s = store.get('session')
+  if (!s) {
+    // no secret on the server = no sign-up there: the demo opens as it always did
+    if (!store.get('ticket') && !store.get('account')) {
+      const st = await call('status', {})
+      if (st.ok && st.configured === false) return { state: 'unconfigured' }
+    }
+    return { state: 'none' }
+  }
+  const r = await call('verify', { session: s })
+  if (r.ok) return { state: 'open', end: r.end, skew: r.now ? r.now * 1000 - Date.now() : 0, tourState: r.tour_state || null, subscriber: !!r.subscriber }
+  if (r.detail === 'not_yet') return { state: 'not_yet', start: r.start, end: r.end, window: r.window }
+  if (r.detail === 'expired') { store.set('session', ''); return { state: 'expired' } }
+  if (r.status === 401) { store.set('session', ''); return { state: 'none' } }
+  return { state: 'error', detail: r.detail }
+}
+
+function Shell({ children, wide }) {
+  return (
+    <div className="wxtrial-wrap">
+      <div className={'wxtrial-card' + (wide ? ' wide' : '')}>
+        <div className="wxtrial-brand"><BrandMark onLight /><Wordmark tagline onLight /></div>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+/** Before the demo: sign up / sign in / wait for the slot / book one. Calls
+ *  onOpen({ end, skew }) once there is a session for an open window. */
+export function TrialGate({ onOpen, initial }) {
+  const ticket = store.get('ticket'), account = store.get('account')
+  const t = peek(account) || peek(ticket)
+  const [mode, setMode] = useState(initial?.state === 'expired' ? 'expired'
+    : initial?.state === 'not_yet' ? 'wait' : account ? 'login' : ticket ? 'signup' : 'none')
+  const [wait, setWait] = useState(initial?.state === 'not_yet' ? initial : null)
+  const [pw, setPw] = useState(''), [pw2, setPw2] = useState('')
+  const [busy, setBusy] = useState(false), [msg, setMsg] = useState(initial?.state === 'error' ? 'Could not reach WAREXX. Check the connection and try again.' : '')
+  const [now, setNow] = useState(Date.now())
+  const email = t?.e || ''
+  // emailed login details? (null until the server has said)
+  const [creds, setCreds] = useState(null)
+  const [em, setEm] = useState(email)
+  useEffect(() => { call('status', {}).then((s) => setCreds(!!(s.ok && s.credentials))) }, [])
+
+  useEffect(() => { const i = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(i) }, [])
+  // waiting for the slot: try again the moment it opens
+  useEffect(() => {
+    if (mode !== 'wait' || !wait) return
+    const ms = wait.start * 1000 - Date.now() + 1500
+    const id = setTimeout(async () => {
+      const r = await checkSession()
+      if (r.state === 'open') onOpen(r); else if (r.state === 'expired') setMode('expired')
+    }, Math.max(1000, ms))
+    return () => clearTimeout(id)
+  }, [mode, wait])
+
+  const after = (r) => {
+    if (r.account) store.set('account', r.account)
+    if (r.session) store.set('session', r.session)
+    checkSession().then((c) => {
+      if (c.state === 'open') onOpen(c)
+      else if (c.state === 'not_yet') { setWait(c); setMode('wait') }
+      else if (c.state === 'expired') setMode('expired')
+      else setMsg('Something went wrong. Please try again.')
+    })
+  }
+  const fail = (r) => {
+    setBusy(false)
+    if (r.detail === 'expired') { store.set('session', ''); setMode('expired'); return }
+    setMsg({
+      wrong_password: 'That password is not right.',
+      weak_password: 'Use at least 8 characters.',
+      invalid_pass: 'This sign-up link is no longer valid. Book a slot again on the website.',
+      too_many_attempts: 'Too many attempts. Please wait a while and try again.',
+      trial_not_configured: 'Demo sign-up is not available right now. Please contact us.',
+      database_unavailable: 'Sign-in is not available right now. Please try again shortly.',
+      offline: 'Could not reach WAREXX. Check the connection and try again.',
+    }[r.detail] || 'Something went wrong. Please try again.')
+  }
+  const signup = async (e) => {
+    e.preventDefault(); setMsg('')
+    if (pw.length < 8) return setMsg('Use at least 8 characters.')
+    if (pw !== pw2) return setMsg('The two passwords do not match.')
+    setBusy(true)
+    const r = await call('signup', { ticket, password: pw })
+    return r.ok ? after(r) : fail(r)
+  }
+  const signin = async (e) => {
+    e.preventDefault(); setMsg(''); setBusy(true)
+    const r = await call('signin', { email: em.trim(), password: pw.trim() })
+    if (!r.ok && r.detail === 'wrong_password') { setBusy(false); return setMsg('That email and password don’t match. Use the details from your email.') }
+    return r.ok ? after(r) : fail(r)
+  }
+  const resend = async () => {
+    setMsg(''); setBusy(true)
+    const r = await call('resend', { ticket })
+    setBusy(false)
+    setMsg(r.ok && r.email_sent ? 'We’ve emailed you a new password — the old one no longer works.'
+      : r.detail === 'too_many_attempts' ? 'Too many emails. Please wait a while and try again.'
+      : 'We couldn’t send the email just now. Please try again shortly.')
+  }
+  const login = async (e) => {
+    e.preventDefault(); setMsg(''); setBusy(true)
+    const r = await call('login', { account, email, password: pw })
+    return r.ok ? after(r) : fail(r)
+  }
+
+  if (mode === 'expired') return <SubscribeCard standalone />
+  const windowLine = t && <p className="wxtrial-slot"><b>Your demo slot</b>{fmtWhen(t.s)} – {new Date(t.x * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}</p>
+
+  if (mode === 'wait') return (
+    <Shell>
+      <h1>Your demo opens soon</h1>
+      <p className="wxtrial-sub">You’re signed up as <b>{email}</b>. WAREXX opens here by itself at the start of your slot.</p>
+      {windowLine}
+      <p className="wxtrial-count">Opens in <b>{left(wait.start * 1000 - now)}</b></p>
+    </Shell>
+  )
+
+  if (creds === null && mode !== 'wait') return <Shell><p className="wxtrial-sub">Please wait…</p></Shell>
+
+  if (creds && (mode === 'signup' || mode === 'login' || mode === 'none')) return (
+    <Shell>
+      <h1>Sign in to your demo</h1>
+      <p className="wxtrial-sub">{email
+        ? <>We’ve emailed your password to <b>{email}</b>. Enter it below to open WAREXX. It works during the two hours of your demo slot.</>
+        : 'Use the login email and password we sent you by email. They work for the two hours of your demo slot.'}</p>
+      {windowLine}
+      <form className="wxtrial-form" onSubmit={signin}>
+        <label><span>Email</span><input type="email" value={em} onChange={(e) => setEm(e.target.value)}
+          readOnly={!!email} autoComplete="username" autoFocus={!email} required /></label>
+        <label><span>Password</span><input type="password" value={pw} onChange={(e) => setPw(e.target.value)}
+          autoFocus={!!email} autoComplete="current-password" required /></label>
+        {msg && <p className="wxtrial-err" role="alert">{msg}</p>}
+        <button className="wxtrial-btn" type="submit" disabled={busy}>{busy ? 'Please wait…' : 'Sign in'}</button>
+      </form>
+      {ticket
+        ? <button className="wxtrial-link" type="button" disabled={busy} onClick={resend}>Didn’t get the email? Send a new password</button>
+        : <a className="wxtrial-link" href={LANDING.replace(/\/?$/, '/') + '#contact'}>No login yet? Book a demo slot</a>}
+    </Shell>
+  )
+
+  if (mode === 'none') return (
+    <Shell>
+      <h1>Book your WAREXX demo</h1>
+      <p className="wxtrial-sub">Pick a two-hour slot on our website, then create your password here to explore WAREXX with a sample business.</p>
+      <a className="wxtrial-btn" href={LANDING.replace(/\/?$/, '/') + '#contact'}>Choose a slot</a>
+    </Shell>
+  )
+
+  const isSignup = mode === 'signup'
+  return (
+    <Shell>
+      <h1>{isSignup ? 'Create your demo account' : 'Sign in to your demo'}</h1>
+      <p className="wxtrial-sub">{isSignup
+        ? 'Choose a password. It opens WAREXX for the two hours of your slot.'
+        : 'Your password works until the end of your slot.'}</p>
+      {windowLine}
+      <form className="wxtrial-form" onSubmit={isSignup ? signup : login}>
+        <label><span>Email</span><input type="email" value={email} readOnly autoComplete="username" /></label>
+        <label><span>Password</span><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} autoFocus
+          autoComplete={isSignup ? 'new-password' : 'current-password'} minLength={isSignup ? 8 : undefined} required /></label>
+        {isSignup && <label><span>Confirm password</span><input type="password" value={pw2} onChange={(e) => setPw2(e.target.value)}
+          autoComplete="new-password" required /></label>}
+        {msg && <p className="wxtrial-err" role="alert">{msg}</p>}
+        <button className="wxtrial-btn" type="submit" disabled={busy}>{busy ? 'Please wait…' : isSignup ? 'Create account & open demo' : 'Sign in'}</button>
+      </form>
+      {!isSignup && ticket && <button className="wxtrial-link" type="button" onClick={() => { store.set('account', ''); setMode('signup'); setMsg('') }}>Set a new password</button>}
+    </Shell>
+  )
+}
+
+/** The card shown when the two hours are over. */
+export function SubscribeCard({ standalone }) {
+  const base = LANDING.replace(/\/?$/, '/')
+  const card = (
+    <div className="wxtrial-card wxtrial-sub-card" role="dialog" aria-modal="true" aria-labelledby="wxtrial-end">
+      <div className="wxtrial-brand"><BrandMark onLight /><Wordmark tagline onLight /></div>
+      <h1 id="wxtrial-end">Your demo time is over</h1>
+      <p className="wxtrial-sub">Thanks for trying WAREXX. Your two-hour demo has ended and its password no longer works.
+        Subscribe to run your own warehouses, stores and stock on WAREXX.</p>
+      <a className="wxtrial-btn" href={base + '#pricing'}>Subscribe to WAREXX</a>
+      <a className="wxtrial-btn ghost" href={base + '#contact'}>Talk to our team</a>
+    </div>
+  )
+  return standalone ? <div className="wxtrial-wrap">{card}</div> : <div className="wxtrial-overlay">{card}</div>
+}
+
+/** Beside the running demo: a quiet countdown, a re-check with the server every
+ *  few minutes and when the tab comes back, and the subscribe card at the end. */
+export function TrialWatch({ end, skew = 0, subscriber = false }) {
+  const [over, setOver] = useState(false)
+  const [hideNote, setHideNote] = useState(false)
+  const [now, setNow] = useState(Date.now() + skew)
+  const endMs = useRef(end * 1000)
+  useEffect(() => {
+    if (over) return
+    const tick = setInterval(() => {
+      const n = Date.now() + skew
+      setNow(n)
+      if (n >= endMs.current) setOver(true)
+    }, 1000)
+    const recheck = async () => {
+      const r = await checkSession()
+      if (r.state === 'expired' || r.state === 'none') setOver(true)
+    }
+    const every = setInterval(recheck, 5 * 60 * 1000)
+    const vis = () => { if (document.visibilityState === 'visible') recheck() }
+    document.addEventListener('visibilitychange', vis)
+    return () => { clearInterval(tick); clearInterval(every); document.removeEventListener('visibilitychange', vis) }
+  }, [over])
+  useEffect(() => { if (over) { store.set('session', ''); document.body.classList.add('wxtrial-ended') } }, [over])
+  if (over) return <SubscribeCard />
+  // a subscriber (the payment page, /pay): no countdown — their own workspace is on its way
+  if (subscriber) return hideNote ? null : (
+    <div className="wxtrial-timer wxtrial-subnote" role="status">
+      <span>Welcome to WAREXX! Your own workspace is being set up — meanwhile, explore with a sample business.</span>
+      <button type="button" aria-label="Dismiss" onClick={() => setHideNote(true)}>×</button>
+    </div>
+  )
+  const ms = endMs.current - now
+  return <div className={'wxtrial-timer' + (ms < 10 * 60 * 1000 ? ' soon' : '')} role="status">Demo time left <b>{left(ms)}</b></div>
+}
+
+// ---- after signing in: watch the demo video, or open the demo -----------------------------
+// The video: VITE_DEMO_VIDEO_URL (a YouTube / Vimeo link or a video file's address), or a
+// file dropped in as demo/public/demo-video.mp4 (served at /demo/demo-video.mp4). Without
+// either, "Watch demo video" says the video is coming soon.
+const VIDEO_URL = (import.meta.env.VITE_DEMO_VIDEO_URL || '').trim()
+const VIDEO_FILE = (import.meta.env.BASE_URL || '/') + 'demo-video.mp4'
+
+function embedOf(url) {
+  const yt = /(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([\w-]{6,})/.exec(url)
+  if (yt) return `https://www.youtube-nocookie.com/embed/${yt[1]}?rel=0&autoplay=1`
+  const vm = /vimeo\.com\/(?:video\/)?(\d+)/.exec(url)
+  if (vm) return `https://player.vimeo.com/video/${vm[1]}?autoplay=1`
+  return ''
+}
+
+async function findVideo() {
+  if (VIDEO_URL) return embedOf(VIDEO_URL) ? { embed: embedOf(VIDEO_URL) } : { file: VIDEO_URL }
+  try {      // a missing file answers with the demo page (HTML), not a video
+    const r = await fetch(VIDEO_FILE, { method: 'HEAD', cache: 'no-cache' })
+    if (r.ok && /^video\//.test(r.headers.get('content-type') || '')) return { file: VIDEO_FILE }
+  } catch { /* offline: no video */ }
+  return null
+}
+
+/** The choice right after signing in: the demo video, or the demo itself. */
+export function DemoWelcome({ email, onTrial }) {
+  const [watching, setWatching] = useState(false)
+  const [video, setVideo] = useState(undefined)        // undefined: looking; null: none yet
+  useEffect(() => { findVideo().then(setVideo) }, [])
+  const name = (email || '').split('@')[0]
+  if (watching) return (
+    <Shell wide>
+      <h1>WAREXX in a few minutes</h1>
+      <div className="wxtrial-video">
+        {video === undefined ? <p className="wxtrial-sub">Loading…</p>
+          : video?.embed ? <iframe src={video.embed} title="WAREXX demo video" allow="autoplay; fullscreen; picture-in-picture" allowFullScreen />
+          : video?.file ? <video src={video.file} controls autoPlay playsInline />
+          : <div className="wxtrial-video-soon"><b>The demo video is coming soon.</b><span>Meanwhile, open the demo and explore it yourself — a short guided tour shows you around.</span></div>}
+      </div>
+      <div className="wxtrial-acts">
+        <button className="wxtrial-btn ghost" type="button" onClick={() => setWatching(false)}>Back</button>
+        <button className="wxtrial-btn" type="button" onClick={onTrial}>Access demo trial →</button>
+      </div>
+    </Shell>
+  )
+  return (
+    <Shell>
+      <h1>You’re in{name ? `, ${name}` : ''}!</h1>
+      <p className="wxtrial-sub">How would you like to start? Watch a short video of WAREXX, or go straight into the demo software with a sample business.</p>
+      <div className="wxtrial-choices">
+        <button className="wxtrial-choice" type="button" onClick={() => setWatching(true)}>
+          <span className="wxtrial-choice-ic" aria-hidden="true">▶</span>
+          <span><b>Watch demo video</b><small>See the key features in a few minutes</small></span>
+        </button>
+        <button className="wxtrial-choice primary" type="button" onClick={onTrial}>
+          <span className="wxtrial-choice-ic" aria-hidden="true">→</span>
+          <span><b>Access demo trial</b><small>Open the WAREXX software now</small></span>
+        </button>
+      </div>
+    </Shell>
+  )
+}

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#141414" />
+    <meta name="robots" content="noindex" />
+    <!-- Isolation: this page may only talk to its own origin, where sw.js answers
+         with the recorded sample business. Any request to another host — the
+         production API included — is refused by the browser. -->
+    <meta http-equiv="Content-Security-Policy" content="connect-src 'self'; form-action 'self'; base-uri 'self'" />
+    <script>
+      // /m/… is the phone app (m/index.html). A host that answers every unknown
+      // address with this page sends a deep link such as /m/grn/12 here on a
+      // first visit; hand it to the phone app, which opens that screen.
+      if (/^\/m(\/|$)/.test(location.pathname)) {
+        location.replace('/m/?go=' + encodeURIComponent(location.pathname + location.search))
+      }
+      // A stylesheet or script of ours that fails to load leaves the demo
+      // unstyled or blank. Two ways it happens:
+      //  - the browser kept a bad copy of the file (e.g. an answer from during a
+      //    redeploy): asking again under a fresh address gets the real file;
+      //  - this page is from before a redeploy and names files that are gone:
+      //    the current page is fetched once, bypassing the cache.
+      (function () {
+        var KEY = 'wx_demo_reloaded'
+        function again() {
+          try { if (sessionStorage.getItem(KEY)) return; sessionStorage.setItem(KEY, '1') } catch (e) { return }
+          var u = new URL(location.href); u.searchParams.set('v', Date.now()); location.replace(u.href)
+        }
+        function refetch(link) {
+          var src = link.href
+          if (src.indexOf('r=') > -1) return again()       // a fresh copy failed too
+          var l = document.createElement('link')
+          l.rel = 'stylesheet'; l.crossOrigin = link.crossOrigin
+          l.href = src + (src.indexOf('?') < 0 ? '?' : '&') + 'r=' + Date.now()
+          link.parentNode.insertBefore(l, link.nextSibling)
+        }
+        window.addEventListener('error', function (e) {
+          var t = e.target, src = t && (t.href || t.src) || ''
+          if (!(t && (t.tagName === 'LINK' || t.tagName === 'SCRIPT') && src.indexOf('/assets/') > -1)) return
+          if (t.tagName === 'LINK') refetch(t); else again()
+        }, true)
+        // A stylesheet refused for its type (HTML where CSS was expected) raises
+        // no error event, so check after loading that ours really applied.
+        window.addEventListener('load', function () {
+          var links = document.querySelectorAll('link[rel="stylesheet"][href*="/assets/"]')
+          for (var i = 0; i < links.length; i++) {
+            var ok = false
+            try { ok = !!(links[i].sheet && links[i].sheet.cssRules.length) } catch (e) { ok = true }
+            if (!ok) refetch(links[i])
+          }
+        })
+        window.addEventListener('vite:preloadError', function (e) { e.preventDefault(); again() })
+        window.addEventListener('load', function () {
+          setTimeout(function () { try { sessionStorage.removeItem(KEY) } catch (e) {} }, 10000)
+        })
+      })()
+    </script>
+    <title>WAREXX · Live demo</title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&family=Montserrat:wght@500&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <style>
+      /* shown until the demo's data layer is ready (a second, once) */
+      #boot { position: fixed; inset: 0; display: grid; place-items: center; background: #141414;
+        color: #EDE6DD; font: 500 14px Inter, system-ui, sans-serif; z-index: 9999; }
+      #boot b { display: block; color: #fff; font-size: 18px; margin-bottom: 6px; letter-spacing: .02em; }
+      #boot .bar { width: 160px; height: 3px; margin: 16px auto 0; background: #262626; border-radius: 2px; overflow: hidden; }
+      #boot .bar i { display: block; width: 40%; height: 100%; background: #EE7A1E; animation: slide 1s ease-in-out infinite alternate; }
+      @keyframes slide { from { transform: translateX(-20%); } to { transform: translateX(170%); } }
+    </style>
+  </head>
+  <body>
+    <div id="boot"><div style="text-align:center"><b>WAREXX live demo</b>Loading the sample business…<div class="bar"><i></i></div></div></div>
+    <div id="root"></div>
+    <script type="module" src="./main.jsx"></script>
+  </body>
+</html>
