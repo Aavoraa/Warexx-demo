@@ -43,7 +43,7 @@ const shape = (p) => p.replace(/\/\d+(?=\/|$)/g, '/:n').replace(/\/[0-9a-f]{8,}(
 // /api/subscribe and /api/payment/* are the real subscription and HDFC
 // SmartGateway endpoints: HDFC sends the customer back to /api/payment/return,
 // and on a browser that has opened the demo this worker sees that request first.
-const REAL = new Set(['/api/leads', '/api/trial', '/api/geo', '/api/admin', '/api/subscribe'])
+const REAL = new Set(['/api/leads', '/api/trial', '/api/geo', '/api/admin', '/api/subscribe', '/api/vision'])
 const ours = (url) => url.origin === self.location.origin && !REAL.has(url.pathname) &&
   !url.pathname.startsWith('/api/payment/') &&
   (url.pathname.startsWith('/api/') || url.pathname === '/api' || url.pathname.startsWith('/pos'))
@@ -59,7 +59,11 @@ self.addEventListener('fetch', (event) => {
   // a page load re-reads the recording, so newly recorded data shows on reload
   // without waiting for this worker to be replaced
   if (event.request.mode === 'navigate' && url.origin === self.location.origin
-      && !url.pathname.startsWith('/pos')) manifestP = null
+      && !url.pathname.startsWith('/pos')) {
+    manifestP = null; visionP = null
+    // a reload starts the demo afresh: uploads read during the last visit go too
+    if (!url.pathname.startsWith('/m')) caches.delete(UPLOADS).catch(() => {})
+  }
   if (event.request.mode === 'navigate' && isMobilePage(url)) {
     event.respondWith(fetch('/m/index.html', { cache: 'no-cache' }))
     return
@@ -286,6 +290,13 @@ async function answer(req, url) {
   const wh = req.headers.get('X-Essa-Warehouse') || '-'
   const path = url.pathname
   const key = `${method} ${wh} ${path}${url.search}`
+  // an invoice the visitor uploaded and Claude Vision read (visionUpload, below)
+  if (method === 'GET' && UPLOADED.test(path)) {
+    const kept = await (await caches.open(UPLOADS)).match(self.location.origin + path + url.search)
+    if (kept) return kept
+    if (path.endsWith('/image')) return new Response(null, { status: 404 })
+  }
+  if (method === 'GET' && (path === '/api/status' || path === '/api/settings')) return visionStatus(m, path)
   // The Item Locator answers ONE code, so it is never matched loosely: a code
   // nobody recorded must say "nothing matches", not replay some other item.
   if (method === 'GET' && path === LOCATE) return locateAnswer(m, url)
@@ -336,17 +347,140 @@ async function answer(req, url) {
   // the demo's Sample Admin. (A recorded answer, above, wins when there is one.)
   if (AUTH[path]) return json(AUTH[path])
 
-  // Vision settings: nothing here can call Anthropic, and a key typed in must not
-  // be echoed back or kept — say so instead of pretending it was switched on
+  // Vision settings: the key is the demo server's (api/vision.js), never one typed
+  // in here — a key sent to this worker is neither echoed back nor kept
   if (method === 'POST' && path.startsWith('/api/settings/')) {
-    return json({ ok: false, demo: true, vision_enabled: false, active_live_provider: 'offline OCR',
-      message: 'This is the demo — Vision cannot be switched on here. In WAREXX, a Super Admin pastes the company\'s Anthropic API key here and new invoice uploads are read by Claude Vision.' })
+    const v = await vision()
+    return json({ ok: false, demo: true, vision_enabled: v.enabled, model: v.model,
+      active_live_provider: v.enabled ? 'claude_vision' : 'offline OCR',
+      message: v.enabled
+        ? 'Vision is already on for this demo — upload an invoice and Claude Vision reads it.'
+        : 'Vision is not switched on for this demo yet. In WAREXX, a Super Admin pastes the company\'s Anthropic API key here.' })
   }
-  if (method === 'POST' && (path === '/api/documents/upload' || path === '/api/documents/manual')) {
-    return sampleInvoice(m, wh, path)
-  }
+  if (method === 'POST' && path === '/api/documents/upload') return visionUpload(req, m, wh)
+  if (method === 'POST' && path === '/api/documents/manual') return sampleInvoice(m, wh, path)
   if (method === 'GET' || method === 'HEAD') return missingRead(path)
   return acknowledgeWrite(req, path, m.meta)
+}
+
+// ---- Claude Vision (api/vision.js) ----
+// The one real server call in the demo: an uploaded invoice is sent to
+// /api/vision, which asks Claude to read it with the WAREXX backend's own prompt,
+// and the reading opens in the real review screen as a new document. Nothing is
+// saved anywhere: the reading is kept in this browser (Cache Storage) only until
+// the demo is reloaded. Without ANTHROPIC_API_KEY on the server, Vision is off and
+// an upload opens a recorded sample invoice, as before.
+const UPLOADS = 'wx-demo-uploads'
+const UPLOADED = /^\/api\/documents\/9\d{5}(?:\/image)?$/
+let visionP = null
+const vision = () => (visionP ||= fetch('/api/vision', { cache: 'no-store' })
+  .then((r) => (r.ok ? r.json() : { enabled: false })).catch(() => ({ enabled: false })))
+
+// /api/status (the profile menu's Vision pill, the scanning overlay) and
+// /api/settings (the Vision panel): the recording, with Vision as it is now
+async function visionStatus(m, path) {
+  const v = await vision()
+  if (path === '/api/settings') {
+    return json({ demo: true, vision_enabled: v.enabled, has_key: false, model: v.model || null,
+      key_masked: v.enabled ? 'kept on the demo server' : null,
+      active_live_provider: v.enabled ? 'claude_vision' : 'offline OCR' })
+  }
+  const e = m.exact.get('GET - /api/status') || pick(m.byPath.get('GET * /api/status'), new URL('/api/status', self.location.origin))
+  let s = {}
+  try { s = e ? await (await replay(e)).json() : {} } catch { /* the recording's own */ }
+  s.providers = { ...(s.providers || {}), claude_vision: v.enabled,
+    active_live_provider: v.enabled ? 'claude_vision' : (s.providers || {}).active_live_provider || null }
+  return json(s)
+}
+
+const b64 = (buf) => {
+  const u = new Uint8Array(buf); let s = ''
+  for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000))
+  return btoa(s)
+}
+// A phone photo is often 4-8 MB; the reading needs far less. Large photos are
+// scaled to 2200 px on the long side as JPEG — where this browser's worker can
+// draw (createImageBitmap + OffscreenCanvas); otherwise the file goes as it is.
+async function shrink(file) {
+  if (!file.type.startsWith('image/') || file.size <= 1.2 * 1024 * 1024) return file
+  try {
+    const bmp = await createImageBitmap(file)
+    const k = Math.min(1, 2200 / Math.max(bmp.width, bmp.height))
+    const c = new OffscreenCanvas(Math.round(bmp.width * k), Math.round(bmp.height * k))
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height)
+    const out = await c.convertToBlob({ type: 'image/jpeg', quality: 0.85 })
+    return out.size < file.size ? out : file
+  } catch { return file }
+}
+
+// The checks the review screen shows as warnings: does the arithmetic add up?
+const num = (v) => (typeof v === 'number' && isFinite(v) ? v : null)
+function invoiceChecks(d) {
+  const warnings = [], flags = {}
+  const lines = Array.isArray(d.line_items) ? d.line_items : []
+  const t = d.totals || {}, x = d.taxes || {}
+  const vals = lines.map((l) => num(l.taxable_value) ?? num(l.amount))
+  if (lines.length && vals.every((v) => v !== null) && num(t.taxable_total) !== null) {
+    const sum = vals.reduce((a, b) => a + b, 0)
+    if (Math.abs(sum - t.taxable_total) > 1) {
+      warnings.push(`Line values sum ${sum.toFixed(2)} ≠ taxable total ${t.taxable_total.toFixed(2)}`)
+      flags['totals.taxable_total'] = 'review'
+    }
+  }
+  if (num(t.taxable_total) !== null && num(t.grand_total) !== null) {
+    const tax = ['cgst_amount', 'sgst_amount', 'igst_amount'].reduce((a, k) => a + (num(x[k]) || 0), 0)
+    const extra = (num(x.other_charges) || 0) + (num(x.freight) || 0) - (num(x.special_discount) || 0) + (num(x.round_off) || 0) - (num(x.tds_amount) || 0)
+    const want = t.taxable_total + tax + extra
+    if (Math.abs(want - t.grand_total) > 2) {
+      warnings.push(`Taxable ${t.taxable_total.toFixed(2)} + tax ${tax.toFixed(2)} = ${want.toFixed(2)} ≠ grand total ${t.grand_total.toFixed(2)}`)
+      flags['totals.grand_total'] = 'review'
+    }
+  }
+  return { warnings, flags }
+}
+
+async function visionUpload(req, m, wh) {
+  const v = await vision()
+  if (!v.enabled) return sampleInvoice(m, wh, '/api/documents/upload')
+  let fd
+  try { fd = await req.formData() } catch { return json({ detail: 'Could not read the upload' }, 400) }
+  const files = fd.getAll('file').filter((f) => f && typeof f === 'object').slice(0, 4)
+  if (!files.length) return json({ detail: 'No file was uploaded' }, 400)
+  const pages = []
+  for (const f of files) {
+    const s = await shrink(f)
+    pages.push({ name: f.name || 'invoice', type: s.type || f.type, blob: s, data: b64(await s.arrayBuffer()) })
+  }
+  let r = null, out
+  try {
+    r = await fetch('/api/vision', { method: 'POST', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'X-Warexx-Demo': '1' },
+      body: JSON.stringify({ files: pages.map(({ name, type, data }) => ({ name, type, data })) }) })
+    out = await r.json()
+  } catch { out = { ok: false, message: 'Vision is unavailable right now — please try again.' } }
+  if (!out || !out.ok || !out.data) {
+    return json({ detail: (out && out.message) || 'Vision could not read that file.' }, r && r.status >= 400 ? r.status : 502)
+  }
+  const d = out.data
+  const id = 900000 + Math.floor(Math.random() * 99999)
+  const at = new Date().toISOString().slice(0, 19)
+  const images = pages.filter((p) => p.type.startsWith('image/'))
+  const { warnings, flags } = invoiceChecks(d)
+  const document = { id, filename: pages[0].name, status: 'needs_review', supplier_id: null,
+    supplier_name: (d.supplier && d.supplier.name) || null, grand_total: num((d.totals || {}).grand_total),
+    invoice_number: (d.invoice && d.invoice.number) || null, confidence: 0.9, uploaded_at: at,
+    content_hash: '', has_image: images.length > 0, page_count: images.length || pages.length }
+  const reading = { document,
+    extraction: { id, provider: 'claude_vision', confidence: 0.9, warnings, field_flags: flags, data: d },
+    history: [{ id, provider: 'claude_vision', confidence: 0.9, is_correction: false, created_at: at }] }
+  const c = await caches.open(UPLOADS)
+  await c.put(self.location.origin + `/api/documents/${id}`, json(reading))
+  for (const [i, p] of images.entries()) {
+    await c.put(self.location.origin + `/api/documents/${id}/image?page=${i}`,
+      new Response(p.blob, { headers: { 'Content-Type': p.type, 'X-Warexx-Demo': '1' } }))
+  }
+  return json({ ...reading, demo: true, vision: true, supplier_recognised: false, profile_used: false, lr_filled: [],
+    message: `👁 Read by Claude Vision${warnings.length ? ` — ${warnings.length} figure(s) to check` : ''}. Review it, then Confirm (in the demo nothing is saved).` })
 }
 
 // An invoice upload (or a blank manual entry): there is no server here to read a

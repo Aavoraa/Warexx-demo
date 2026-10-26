@@ -6615,7 +6615,7 @@ function VisionSettings({ onClose, onChanged, toast }) {
           <div>
             <div style={{ fontWeight: 600 }}>{on ? 'Vision mode is ON' : 'Vision mode is OFF'}</div>
             <div className="small">{on
-              ? `key ${st.key_masked} · model ${st.model}`
+              ? (demo ? `model ${st.model} · key kept on the demo server` : `key ${st.key_masked} · model ${st.model}`)
               : `new uploads currently use ${st?.active_live_provider || 'offline OCR'}`}</div>
           </div>
         </div>
@@ -6623,9 +6623,13 @@ function VisionSettings({ onClose, onChanged, toast }) {
         {demo && (
           <div className="small" style={{ margin: '0 0 14px', padding: '10px 12px', borderRadius: 8,
             background: 'var(--panel-2)', border: '1px solid var(--line)', lineHeight: 1.5 }}>
-            <b>In WAREXX</b>, a Super Admin pastes the company's Anthropic API key here and clicks
-            Activate: new invoice uploads are then read by Claude Vision, and the model can be chosen
-            below. This demo has no server, so Vision stays off here and uploads open a sample invoice.
+            {on
+              ? <>Vision is <b>on for this demo</b>: upload an invoice photo or PDF (Procurement →
+                  Invoice Entry) and Claude Vision reads it into the review screen. Nothing you upload is
+                  saved. In WAREXX, a Super Admin turns Vision on here with the company's Anthropic API key.</>
+              : <><b>In WAREXX</b>, a Super Admin pastes the company's Anthropic API key here and clicks
+                  Activate: new invoice uploads are then read by Claude Vision. Vision is not switched on
+                  for this demo yet, so uploads open a sample invoice.</>}
           </div>
         )}
         {!demo && <div className="field" style={{ marginBottom: 10 }}>
@@ -6649,9 +6653,10 @@ function VisionSettings({ onClose, onChanged, toast }) {
         )}
 
         <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          {demo ? <button className="btn primary" onClick={onClose}>Done</button> : <>
           <button className="btn primary" disabled={busy} onClick={activate}>
             {busy ? 'Checking…' : 'Activate vision'}</button>
-          {on && <button className="btn" disabled={busy} onClick={turnOff}>Turn off</button>}
+          {on && <button className="btn" disabled={busy} onClick={turnOff}>Turn off</button>}</>}
           <div className="spacer" style={{ flex: 1 }} />
         </div>
       </div>

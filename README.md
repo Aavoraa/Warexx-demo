@@ -27,3 +27,17 @@ The demo must be served from the root of its origin (the service worker answers 
 - `frontend/tools/mobile-page.mjs` — builds the phone app at `/m`
 - `demo-data/recorded/` — the recorded answers (`manifest.json` + `bodies/`)
 - `vercel.json` — Vercel build and headers
+
+## Claude Vision (invoice reading)
+
+`api/vision.js` is the demo's one server function. When an invoice is uploaded
+(Procurement → Invoice Entry → Upload invoice), the service worker sends it there;
+it asks Claude to read it with the same instructions the WAREXX backend uses, and
+the reading opens in the review screen. Nothing is saved: the reading stays in the
+visitor's browser until the demo is reloaded.
+
+Set in Vercel → Project → Settings → Environment Variables, then redeploy:
+
+- `ANTHROPIC_API_KEY` — required; without it Vision is off and an upload opens a sample invoice
+- `VISION_MODEL` — optional, default `claude-opus-5-5`
+- `VISION_PER_HOUR` — optional, uploads per visitor per hour (default 6)
