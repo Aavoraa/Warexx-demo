@@ -336,6 +336,12 @@ async function answer(req, url) {
   // the demo's Sample Admin. (A recorded answer, above, wins when there is one.)
   if (AUTH[path]) return json(AUTH[path])
 
+  // Vision settings: nothing here can call Anthropic, and a key typed in must not
+  // be echoed back or kept — say so instead of pretending it was switched on
+  if (method === 'POST' && path.startsWith('/api/settings/')) {
+    return json({ ok: false, demo: true, vision_enabled: false, active_live_provider: 'offline OCR',
+      message: 'This is the demo — Vision cannot be switched on here. In WAREXX, a Super Admin pastes the company\'s Anthropic API key here and new invoice uploads are read by Claude Vision.' })
+  }
   if (method === 'POST' && (path === '/api/documents/upload' || path === '/api/documents/manual')) {
     return sampleInvoice(m, wh, path)
   }

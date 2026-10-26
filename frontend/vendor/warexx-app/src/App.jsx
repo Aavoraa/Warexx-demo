@@ -6557,6 +6557,8 @@ function Reports() {
 
 // ---------- vision settings modal ----------
 function VisionSettings({ onClose, onChanged, toast }) {
+  // the public demo (demo/main.jsx marks <body>): no server to hold a key or call Anthropic
+  const demo = document.body.classList.contains('wxdemo')
   const [st, setSt] = useState(null)
   const [key, setKey] = useState('')
   const [models, setModels] = useState([])
@@ -6569,11 +6571,11 @@ function VisionSettings({ onClose, onChanged, toast }) {
   }, [])
 
   const activate = async () => {
-    if (!key.trim()) { toast('Paste your Anthropic API key first', 'err'); return }
+    if (!key.trim() && !demo) { toast('Paste your Anthropic API key first', 'err'); return }
     setBusy(true)
     try {
       const r = await api.setVisionKey(key.trim(), null)
-      if (!r.ok) { toast(r.message || 'Could not activate', 'err'); setBusy(false); return }
+      if (!r.ok) { toast(r.message || 'Could not activate', r.demo ? 'ok' : 'err'); setBusy(false); return }
       if (r.models) setModels(r.models)
       toast(r.verified ? '👁 Vision on · ' + (r.chosen_model || '') : '👁 Vision on (' + r.message + ')', 'ok')
       setKey(''); setSt(r); onChanged && onChanged()
@@ -6618,11 +6620,19 @@ function VisionSettings({ onClose, onChanged, toast }) {
           </div>
         </div>
 
-        <div className="field" style={{ marginBottom: 10 }}>
+        {demo && (
+          <div className="small" style={{ margin: '0 0 14px', padding: '10px 12px', borderRadius: 8,
+            background: 'var(--panel-2)', border: '1px solid var(--line)', lineHeight: 1.5 }}>
+            <b>In WAREXX</b>, a Super Admin pastes the company's Anthropic API key here and clicks
+            Activate: new invoice uploads are then read by Claude Vision, and the model can be chosen
+            below. This demo has no server, so Vision stays off here and uploads open a sample invoice.
+          </div>
+        )}
+        {!demo && <div className="field" style={{ marginBottom: 10 }}>
           <label>Anthropic API key</label>
           <input type="password" value={key} placeholder={on ? '•••• stored — paste a new key to replace' : ''}
             onChange={(e) => setKey(e.target.value)} autoComplete="off" />
-        </div>
+        </div>}
         {on && (
           <div className="field" style={{ marginBottom: 14 }}>
             <label>Model {models.length ? `(${models.length} available on your key)` : ''}</label>
@@ -19288,8 +19298,14 @@ export default function App() {
             {ROLE_HELP[role] && <div className="pop-note">{ROLE_HELP[role]}</div>}
             <div className="pop-status">
               <span className={'pop-pill' + (status ? ' on' : '')}><i />{status ? 'Server connected' : 'Connecting…'}</span>
-              <span className={'pop-pill' + (providers.claude_vision ? ' on' : '')}><i />Vision {providers.claude_vision ? 'on' : 'off'}</span>
-              <span className={'pop-pill' + (providers.tesseract ? ' on' : '')}><i />OCR {providers.tesseract ? 'on' : 'off'}</span>
+              {/* Vision / OCR open the extraction settings (Super Admin, who can change them) */}
+              {[['Vision', providers.claude_vision], ['OCR', providers.tesseract]].map(([label, on]) => isSuper ? (
+                <button key={label} type="button" className={'pop-pill pop-pill-btn' + (on ? ' on' : '')}
+                  title="Vision extraction settings" onClick={() => { setMenu(null); setShowSettings(true) }}>
+                  <i />{label} {on ? 'on' : 'off'}</button>
+              ) : (
+                <span key={label} className={'pop-pill' + (on ? ' on' : '')}><i />{label} {on ? 'on' : 'off'}</span>
+              ))}
             </div>
             <button role="menuitem" className="pop-row" onClick={() => { setMenu(null); setShowProfile(true) }}>
               <Icon name="usercheck" size={16} /><span className="pop-tx"><b>My profile</b></span></button>

@@ -2849,6 +2849,9 @@ table.items tr.warnrow td { background: var(--warn-bg); }
 .pop-pill i { width: 6px; height: 6px; border-radius: 50%; background: #B5AEA5; }
 .pop-pill.on { background: var(--ok-bg); color: var(--ok); }
 .pop-pill.on i { background: #35A36B; }
+.pop-pill-btn { border: 1px solid transparent; font-family: inherit; line-height: inherit; cursor: pointer; }
+.pop-pill-btn:hover { border-color: var(--line); color: var(--text); }
+.pop-pill-btn:focus-visible { outline: 2px solid var(--accent, #1A1814); outline-offset: 1px; }
 
 /* open tabs: quiet pills on the page, under the header */
 .tabstrip { background: transparent; border-bottom: none; padding: 0 24px; height: 40px; gap: 6px; align-items: center; }
