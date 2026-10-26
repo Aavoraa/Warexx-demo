@@ -1,8 +1,10 @@
 // Claude Vision for the demo: the one real server call behind it.
 //
 //   GET  /api/vision  → { enabled, model }          (is Vision on for this demo?)
-//   POST /api/vision  { files: [{ name, type, data }] }  (data = base64)
-//                     → { ok, data, provider, notes } — the canonical invoice JSON
+//   POST /api/vision  { kind, files: [{ name, type, data }] }  (data = base64)
+//                     → { ok, data, provider, notes }
+//     kind "invoice" (default): a supplier's bill → the canonical invoice JSON
+//     kind "po": a photographed purchase order → the draft order (po_extract.py)
 //
 // The visitor's invoice upload is caught by the demo's service worker
 // (frontend/demo/public/sw.js), which sends the file here and shows what comes
@@ -99,6 +101,53 @@ name to the text exactly as it appears on the page.
 If the document is not an invoice, bill, challan or similar purchase document,
 return {"not_an_invoice": true, "what_it_is": "<a few words>"} instead.`
 
+// app/services/po_extract.py, PO_PROMPT — a purchase order is our own request
+// to a supplier: no tax block, no supplier profile; one call, one shape back
+const PO_PROMPT = `You are reading an Indian garment wholesaler's PURCHASE ORDER —
+the document the BUYER issues to a supplier saying what they want. It may be a
+printed order, a letterhead form filled in by hand, or a photograph of a page
+from an order book.
+
+Return a JSON object with these keys (use null for anything the page does not
+show — do NOT invent a value):
+- po_no (the order number printed on the page, if any)
+- po_date (ISO YYYY-MM-DD)
+- supplier_name (who the order is ADDRESSED TO — the seller)
+- company (the buying firm issuing the order, usually on the letterhead)
+- brand
+- item (the general description of the goods ordered)
+- place (delivery place / destination, if named)
+- transport (transporter or delivery mode, if named)
+- agent (selling / commission agent, if named)
+- purchaser (the buyer or purchase manager who raised it)
+- discount_pct (a percentage discount stated for the whole order, as a number)
+- lines: an array, ONE OBJECT PER ROW of the order's item table, each with:
+    - particulars (the description column, verbatim)
+    - size (the size or size mix exactly as written, e.g. "30:2, 32:4, 34:4")
+    - qty (a number)
+    - uom (PCS, DOZ, MTR, SET …)
+    - rate (price per unit, a number)
+    - amount (the row total as PRINTED — do not compute it if it is not there)
+    - brand, design_no, hsn (if the table has those columns)
+
+IMPORTANT:
+- The supplier is who the order is sent TO. The company is who sent it. Getting
+  these the wrong way round is the single most common error on this document.
+- Transcribe EVERY row of the item table.
+- Numbers as numbers, with no currency symbols, commas or units.
+- An order carries no tax block and usually no grand total. Do not invent one.
+
+LANGUAGE
+The page may be written in Tamil. Read it in whatever language it is written and
+return every text value in English; numbers, dates and codes exactly as written.
+Whenever you translate a value, add an "original_values" key to the object it
+belongs to, mapping the field name to the text as it appears on the page.
+
+If the page is not a purchase order or similar order form, return
+{"not_an_order": true, "what_it_is": "<a few words>"} instead.
+
+Return ONLY the JSON object.`
+
 // Uploads per visitor per hour, per running instance — a brake on a public demo
 // spending the key, not an exact quota.
 const seen = new Map()
@@ -159,6 +208,7 @@ export default async function handler(req, res) {
   }
   if (total > MAX_BYTES) return send(res, 413, { ok: false, message: 'That file is too large for the demo (3 MB at most).' })
 
+  const kind = body.kind === 'po' ? 'po' : 'invoice'
   const n = files.length
   let guidance = `Canonical schema to fill:\n${JSON.stringify(FULL_SCHEMA, null, 2)}`
   if (n > 1) {
@@ -173,7 +223,7 @@ export default async function handler(req, res) {
       ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: f.data } }
       : { type: 'image', source: { type: 'base64', media_type: f.type, data: f.data } })
   })
-  content.push({ type: 'text', text: guidance + '\n\nReturn the JSON now.' })
+  content.push({ type: 'text', text: kind === 'po' ? PO_PROMPT : guidance + '\n\nReturn the JSON now.' })
 
   const client = new Anthropic()
   let msg
@@ -183,7 +233,7 @@ export default async function handler(req, res) {
     msg = await client.beta.messages.stream({
       model: MODEL,
       max_tokens: 32000,
-      system: SYSTEM,
+      ...(kind === 'po' ? {} : { system: SYSTEM }),
       betas: ['server-side-fallback-2026-07-01'],
       fallbacks: 'default',
       messages: [{ role: 'user', content }],
@@ -202,6 +252,9 @@ export default async function handler(req, res) {
   if (!data) {
     return send(res, 422, { ok: false, message: msg.stop_reason === 'max_tokens'
       ? 'That invoice is too long for one reading.' : 'Vision could not make sense of that file.' })
+  }
+  if (data.not_an_order) {
+    return send(res, 422, { ok: false, message: `That does not look like a purchase order${data.what_it_is ? ` (it looks like ${data.what_it_is})` : ''}.` })
   }
   if (data.not_an_invoice) {
     return send(res, 422, { ok: false, message: `That does not look like an invoice${data.what_it_is ? ` (it looks like ${data.what_it_is})` : ''}. Upload a supplier's bill.` })

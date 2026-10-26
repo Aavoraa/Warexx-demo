@@ -297,6 +297,9 @@ async function answer(req, url) {
     if (path.endsWith('/image')) return new Response(null, { status: 404 })
   }
   if (method === 'GET' && (path === '/api/status' || path === '/api/settings')) return visionStatus(m, path)
+  // Purchase Orders → "Read an order" asks first whether it can (po_extract.py)
+  if (method === 'GET' && path === '/api/purchase-orders/extract/status') return json({ available: (await vision()).enabled })
+  if (method === 'POST' && path === '/api/purchase-orders/extract') return visionOrder(req)
   // The Item Locator answers ONE code, so it is never matched loosely: a code
   // nobody recorded must say "nothing matches", not replay some other item.
   if (method === 'GET' && path === LOCATE) return locateAnswer(m, url)
@@ -481,6 +484,88 @@ async function visionUpload(req, m, wh) {
   }
   return json({ ...reading, demo: true, vision: true, supplier_recognised: false, profile_used: false, lr_filled: [],
     message: `👁 Read by Claude Vision${warnings.length ? ` — ${warnings.length} figure(s) to check` : ''}. Review it, then Confirm (in the demo nothing is saved).` })
+}
+
+// ---- "Read an order": a photographed purchase order → a DRAFT on the order form ----
+// The same answer app/routers/purchase_orders.py gives: nothing is saved, the
+// person checks the draft and presses Save. _clean and validate follow
+// app/services/po_extract.py, so the flags mean what they mean in WAREXX.
+const PO_FIELDS = ['po_no', 'po_date', 'supplier_name', 'company', 'brand', 'item',
+  'place', 'transport', 'agent', 'purchaser', 'discount_pct']
+const PO_LINE_FIELDS = ['particulars', 'size', 'qty', 'uom', 'rate', 'amount', 'brand', 'design_no', 'hsn']
+const anyNum = (v) => {
+  if (v === null || v === undefined || v === '') return null
+  const n = parseFloat(String(v).replace(/[,₹\s]/g, ''))
+  return isFinite(n) ? n : null
+}
+// "05/10/2026", "5-10-26" and the ISO form → YYYY-MM-DD (Indian order: day first)
+const isoDate = (v) => {
+  const s = String(v || '').trim()
+  let mm = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/)
+  if (mm) return `${mm[1]}-${mm[2].padStart(2, '0')}-${mm[3].padStart(2, '0')}`
+  mm = s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/)
+  if (mm) return `${mm[3].length === 2 ? '20' + mm[3] : mm[3]}-${mm[2].padStart(2, '0')}-${mm[1].padStart(2, '0')}`
+  return null
+}
+function poClean(d) {
+  const out = {}
+  for (const k of PO_FIELDS) out[k] = d[k] ?? null
+  out.po_date = out.po_date ? (isoDate(out.po_date) || out.po_date) : null
+  out.discount_pct = anyNum(out.discount_pct)
+  out.lines = (Array.isArray(d.lines) ? d.lines : []).filter((l) => l && typeof l === 'object').map((raw) => {
+    const l = {}
+    for (const k of PO_LINE_FIELDS) l[k] = raw[k] ?? null
+    for (const k of ['qty', 'rate', 'amount']) l[k] = anyNum(l[k])
+    return l
+  }).filter((l) => Object.values(l).some((v) => v !== null && v !== ''))
+  return out
+}
+function poValidate(draft) {
+  const warnings = [], flags = {}
+  if (!String(draft.supplier_name || '').trim()) {
+    flags.supplier_name = true; warnings.push('No supplier could be read — an order cannot be confirmed without one')
+  }
+  if (!isoDate(draft.po_date)) { flags.po_date = true; warnings.push('The order date could not be read as a date') }
+  if (!draft.lines.length) warnings.push('No item rows were found on the page')
+  draft.lines.forEach((l, i) => {
+    if (!String(l.particulars || '').trim()) flags[`lines.${i}.particulars`] = true
+    if (l.qty === null) flags[`lines.${i}.qty`] = true
+    if (l.qty !== null && l.rate !== null && l.amount !== null && Math.abs(l.qty * l.rate - l.amount) > 1) {
+      flags[`lines.${i}.amount`] = true
+      warnings.push(`Row ${i + 1}: ${l.qty} x ${l.rate} is ${+(l.qty * l.rate).toFixed(2)}, but the page says ${l.amount}`)
+    }
+  })
+  const score = 1 - 0.08 * Object.keys(flags).length - 0.05 * warnings.length
+  return { warnings, field_flags: flags, confidence: Math.round(Math.max(0, Math.min(1, score)) * 100) / 100 }
+}
+async function visionOrder(req) {
+  const empty = poClean({})
+  const v = await vision()
+  if (!v.enabled) {
+    return json({ document_id: null, entry_source: 'import', draft: empty, provider: 'unavailable', language: null,
+      note: 'Vision is not switched on for this demo — key the order in by hand.', ...poValidate(empty) })
+  }
+  let file
+  try { file = (await req.formData()).get('file') } catch { /* below */ }
+  if (!file || typeof file !== 'object') return json({ detail: 'that file is empty' }, 400)
+  const s = await shrink(file)
+  let r = null, out
+  try {
+    r = await fetch('/api/vision', { method: 'POST', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'X-Warexx-Demo': '1' },
+      body: JSON.stringify({ kind: 'po', files: [{ name: file.name || 'order', type: s.type || file.type, data: b64(await s.arrayBuffer()) }] }) })
+    out = await r.json()
+  } catch { out = { ok: false, message: 'Vision is unavailable right now — please try again.' } }
+  if (!out || !out.ok || !out.data) {
+    // like the backend: a failed read still opens the form, with the reason
+    return json({ document_id: null, entry_source: 'import', draft: empty, provider: 'error', language: null,
+      note: ((out && out.message) || 'The page could not be read.') + ' Key the order in by hand, or try a clearer photograph.',
+      ...poValidate(empty) })
+  }
+  const draft = poClean(out.data)
+  return json({ document_id: null, entry_source: 'import', draft, provider: 'claude_vision',
+    note: `${draft.lines.length} row(s) read by vision`, language: null,
+    original_values: out.data.original_values || {}, ...poValidate(draft) })
 }
 
 // An invoice upload (or a blank manual entry): there is no server here to read a
